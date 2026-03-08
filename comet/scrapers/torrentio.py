@@ -1,51 +1,62 @@
 import re
 
+from comet.core.logger import log_scraper_error
+from comet.scrapers.base import BaseScraper
+from comet.scrapers.models import ScrapeRequest
+from comet.utils.formatting import size_to_bytes
 
-from comet.utils.general import (
-    size_to_bytes,
-    log_scraper_error,
-    fetch_with_proxy_fallback,
-)
-
-
-data_pattern = re.compile(
+DATA_PATTERN = re.compile(
     r"(?:👤 (\d+) )?💾 ([\d.]+ [KMGT]B)(?: ⚙️ (\w+))?", re.IGNORECASE
 )
 
 
-async def get_torrentio(manager, url: str):
-    torrents = []
-    try:
-        results = await fetch_with_proxy_fallback(
-            f"{url}/stream/{manager.media_type}/{manager.media_id}.json"
-        )
+class TorrentioScraper(BaseScraper):
+    impersonate = "chrome"
 
-        for torrent in results["streams"]:
-            title_full = torrent["title"]
+    def __init__(self, manager, session, url: str):
+        super().__init__(manager, session, url)
 
-            if "\n💾" in title_full:
-                title = title_full.split("\n💾")[0].split("\n")[-1]
-            else:
-                title = title_full.split("\n")[0]
+    async def scrape(self, request: ScrapeRequest):
+        torrents = []
+        try:
+            async with self.session.get(
+                f"{self.url}/stream/{request.media_type}/{request.media_id}.json",
+            ) as response:
+                results = await response.json()
 
-            match = data_pattern.search(title_full)
+            if not results or "streams" not in results:
+                return []
 
-            seeders = int(match.group(1)) if match.group(1) else None
-            size = size_to_bytes(match.group(2))
-            tracker = match.group(3) if match.group(3) else "KnightCrawler"
+            for torrent in results["streams"]:
+                title_full = torrent["title"]
 
-            torrents.append(
-                {
-                    "title": title,
-                    "infoHash": torrent["infoHash"].lower(),
-                    "fileIndex": torrent.get("fileIdx", None),
-                    "seeders": seeders,
-                    "size": size,
-                    "tracker": f"Torrentio|{tracker}",
-                    "sources": torrent.get("sources", []),
-                }
-            )
-    except Exception as e:
-        log_scraper_error("Torrentio", url, manager.media_id, e)
+                if "\n💾" in title_full:
+                    title = title_full.split("\n💾")[0].split("\n")[-1]
+                else:
+                    title = title_full.split("\n")[0]
 
-    await manager.filter_manager(torrents)
+                match = DATA_PATTERN.search(title_full)
+
+                seeders = int(match.group(1)) if match and match.group(1) else None
+                size = (
+                    size_to_bytes(match.group(2)) if match and match.group(2) else None
+                )
+                tracker = (
+                    match.group(3) if match and match.group(3) else "KnightCrawler"
+                )
+
+                torrents.append(
+                    {
+                        "title": title,
+                        "infoHash": torrent["infoHash"].lower(),
+                        "fileIndex": torrent.get("fileIdx", None),
+                        "seeders": seeders,
+                        "size": size,
+                        "tracker": f"Torrentio|{tracker}",
+                        "sources": torrent.get("sources", []),
+                    }
+                )
+        except Exception as e:
+            log_scraper_error("Torrentio", self.url, request.media_id, e)
+
+        return torrents

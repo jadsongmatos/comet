@@ -1,76 +1,115 @@
-import aiohttp
 import asyncio
 import time
+
+import aiohttp
 import orjson
 
-from comet.utils.models import database, settings
-from comet.utils.general import parse_media_id
-from comet.utils.anime_mapper import anime_mapper
+from comet.core.database import ON_CONFLICT_DO_NOTHING, OR_IGNORE, database
+from comet.core.logger import logger
+from comet.core.models import settings
+from comet.services.anime import anime_mapper
+from comet.utils.parsing import parse_media_id
 
-from .kitsu import get_kitsu_metadata, get_kitsu_aliases
 from .imdb import get_imdb_metadata
+from .kitsu import get_kitsu_metadata
 from .trakt import get_trakt_aliases
+
+_CACHE_SELECT_QUERY = """
+    SELECT title, year, year_end, aliases
+    FROM metadata_cache
+    WHERE media_id = :media_id
+    AND timestamp >= :min_timestamp
+"""
+
+_CACHE_INSERT_QUERY = f"""
+    INSERT {OR_IGNORE} INTO metadata_cache
+    VALUES (:media_id, :title, :year, :year_end, :aliases, :timestamp)
+    {ON_CONFLICT_DO_NOTHING}
+"""
 
 
 class MetadataScraper:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
-    async def fetch_metadata_and_aliases(self, media_type: str, media_id: str):
-        id, season, episode = parse_media_id(media_type, media_id)
+    async def get_from_cache_by_media_id(
+        self, media_id: str, id: str, season: int | None, episode: int | None
+    ):
+        provider = self._extract_provider(media_id)
+        cache_id = f"{provider}:{id}" if provider else id
+        cache_season = 1 if provider == "kitsu" else season
 
-        get_cached = await self.get_cached(
-            id, season if "kitsu" not in media_id else 1, episode
-        )
+        return await self.get_cached(cache_id, cache_season, episode)
+
+    async def fetch_metadata_and_aliases(
+        self,
+        media_type: str,
+        media_id: str,
+        id: str | None = None,
+        season: int | None = None,
+        episode: int | None = None,
+    ):
+        if id is None:
+            id, season, episode = parse_media_id(media_type, media_id)
+
+        provider = self._extract_provider(media_id)
+        cache_id = f"{provider}:{id}" if provider else id
+        cache_season = 1 if provider == "kitsu" else season
+
+        get_cached = await self.get_cached(cache_id, cache_season, episode)
         if get_cached is not None:
             return get_cached[0], get_cached[1]
 
-        is_kitsu = "kitsu" in media_id
+        is_kitsu = provider == "kitsu"
+
         metadata_task = asyncio.create_task(
-            self.get_metadata(id, season, episode, is_kitsu)
+            self.get_metadata(id, season, episode, is_kitsu, media_type)
         )
-        aliases_task = asyncio.create_task(self.get_aliases(media_type, id, is_kitsu))
+        aliases_task = asyncio.create_task(self.get_aliases(media_type, id, provider))
         metadata, aliases = await asyncio.gather(metadata_task, aliases_task)
 
         if metadata is not None:
-            await self.cache_metadata(id, metadata, aliases)
+            await self.cache_metadata(cache_id, metadata, aliases)
 
         return metadata, aliases
 
+    @staticmethod
+    def _extract_provider(media_id: str):
+        if media_id.startswith("tt"):
+            return "imdb"
+
+        first_part, sep, _ = media_id.partition(":")
+
+        if sep:
+            return first_part.lower()
+
+        return None
+
     async def get_cached(self, media_id: str, season: int, episode: int):
         row = await database.fetch_one(
-            """
-                SELECT title, year, year_end, aliases
-                FROM metadata_cache
-                WHERE media_id = :media_id
-                AND timestamp + :cache_ttl >= :current_time
-            """,
+            _CACHE_SELECT_QUERY,
             {
                 "media_id": media_id,
-                "cache_ttl": settings.METADATA_CACHE_TTL,
-                "current_time": time.time(),
+                "min_timestamp": time.time() - settings.METADATA_CACHE_TTL,
             },
         )
-        if row is not None:
-            metadata = {
+        if row is None:
+            return None
+
+        return (
+            {
                 "title": row["title"],
                 "year": row["year"],
                 "year_end": row["year_end"],
                 "season": season,
                 "episode": episode,
-            }
-            return metadata, orjson.loads(row["aliases"])
-
-        return None
+            },
+            orjson.loads(row["aliases"]),
+        )
 
     async def cache_metadata(self, media_id: str, metadata: dict, aliases: dict):
         await database.execute(
-            f"""
-                INSERT {"OR IGNORE " if settings.DATABASE_TYPE == "sqlite" else ""}
-                INTO metadata_cache
-                VALUES (:media_id, :title, :year, :year_end, :aliases, :timestamp)
-                {" ON CONFLICT DO NOTHING" if settings.DATABASE_TYPE == "postgresql" else ""}
-            """,
+            _CACHE_INSERT_QUERY,
             {
                 "media_id": media_id,
                 "title": metadata["title"],
@@ -82,6 +121,9 @@ class MetadataScraper:
         )
 
     def normalize_metadata(self, metadata: dict, season: int, episode: int):
+        if not metadata:
+            return None
+
         title, year, year_end = metadata
 
         if title is None:  # metadata retrieving failed
@@ -95,12 +137,14 @@ class MetadataScraper:
             "episode": episode,
         }
 
-    async def get_metadata(self, id: str, season: int, episode: int, is_kitsu: bool):
+    async def get_metadata(
+        self, id: str, season: int, episode: int, is_kitsu: bool, media_type: str
+    ):
         if is_kitsu:
             raw_metadata = await get_kitsu_metadata(self.session, id)
             return self.normalize_metadata(raw_metadata, 1, episode)
         else:
-            raw_metadata = await get_imdb_metadata(self.session, id)
+            raw_metadata = await get_imdb_metadata(self.session, id, media_type)
             return self.normalize_metadata(raw_metadata, season, episode)
 
     async def fetch_aliases_with_metadata(
@@ -110,14 +154,19 @@ class MetadataScraper:
         title: str,
         year: int,
         year_end: int = None,
+        id: str | None = None,
     ):
         """
         Fetch only aliases for media when we already have the metadata from another source.
         This method will cache the provided metadata along with the scraped aliases.
         """
-        id, _, _ = parse_media_id(media_type, media_id)
+        if id is None:
+            id, _, _ = parse_media_id(media_type, media_id)
 
-        get_cached = await self.get_cached(id, 1, 1)
+        provider = self._extract_provider(media_id)
+        cache_id = f"{provider}:{id}" if provider else id
+
+        get_cached = await self.get_cached(cache_id, 1, 1)
         if get_cached is not None:
             return get_cached[0], get_cached[1]
 
@@ -127,64 +176,42 @@ class MetadataScraper:
             "year_end": year_end,
         }
 
-        is_kitsu = "kitsu" in media_id
-        aliases = await self.get_aliases(media_type, id, is_kitsu)
+        aliases = await self.get_aliases(media_type, id, provider)
 
-        await self.cache_metadata(id, metadata, aliases)
+        await self.cache_metadata(cache_id, metadata, aliases)
 
         return metadata, aliases
 
-    def combine_aliases(self, kitsu_aliases: dict, trakt_aliases: dict):
-        combined = {"ez": []}
+    async def get_aliases(
+        self,
+        media_type: str,
+        media_id: str,
+        provider: str | None = None,
+    ):
+        if anime_mapper.is_loaded():
+            full_media_id = f"{provider}:{media_id}"
 
-        # Add Kitsu aliases
-        if kitsu_aliases and "ez" in kitsu_aliases:
-            combined["ez"].extend(kitsu_aliases["ez"])
+            if anime_mapper.is_anime_content(full_media_id, media_id):
+                aliases = await anime_mapper.get_aliases(full_media_id)
+                logger.log(
+                    "SCRAPER",
+                    f"📜 Found {len(aliases.get('ez', []))} Anime title aliases for {media_id}",
+                )
+                if aliases:
+                    return aliases
 
-        # Add Trakt aliases
-        if trakt_aliases and "ez" in trakt_aliases:
-            combined["ez"].extend(trakt_aliases["ez"])
+        if provider == "kitsu":
+            logger.log("SCRAPER", f"📜 No Anime title aliases found for {media_id}")
+            return {}
 
-        # Case-insensitive deduplication
-        combined["ez"] = list(
-            {alias.lower(): alias for alias in combined["ez"]}.values()
-        )
-
-        return combined if combined["ez"] else {}
-
-    async def get_aliases(self, media_type: str, media_id: str, is_kitsu: bool):
-        if not anime_mapper.is_loaded():
-            # Fallback to original behavior if mapping not loaded
-            if is_kitsu:
-                return await get_kitsu_aliases(self.session, media_id)
-            return await get_trakt_aliases(self.session, media_type, media_id)
-
-        kitsu_aliases = {}
-        trakt_aliases = {}
-
-        if is_kitsu:
-            # Get Kitsu aliases
-            kitsu_aliases = await get_kitsu_aliases(self.session, media_id)
-
-            # Try to convert Kitsu ID to IMDB ID for Trakt aliases
-            try:
-                kitsu_id = int(media_id)
-                imdb_id = anime_mapper.get_imdb_from_kitsu(kitsu_id)
-                if imdb_id:
-                    # We have an IMDB ID, get Trakt aliases too
-                    trakt_aliases = await get_trakt_aliases(
-                        self.session, media_type, imdb_id
-                    )
-            except Exception:
-                pass
+        trakt_aliases = await get_trakt_aliases(self.session, media_type, media_id)
+        if trakt_aliases:
+            total_aliases = sum(len(titles) for titles in trakt_aliases.values())
+            logger.log(
+                "SCRAPER",
+                f"📜 Found {total_aliases} Trakt title aliases for {media_id}",
+            )
         else:
-            # Get Trakt aliases for IMDB ID
-            trakt_aliases = await get_trakt_aliases(self.session, media_type, media_id)
+            logger.log("SCRAPER", f"📜 No Trakt title aliases found for {media_id}")
 
-            # Check if this IMDB ID has a Kitsu equivalent for additional aliases
-            kitsu_id = anime_mapper.get_kitsu_from_imdb(media_id)
-            if kitsu_id:
-                kitsu_aliases = await get_kitsu_aliases(self.session, str(kitsu_id))
-
-        # Combine the aliases from both sources
-        return self.combine_aliases(kitsu_aliases, trakt_aliases)
+        return trakt_aliases

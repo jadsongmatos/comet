@@ -1,47 +1,57 @@
-from comet.utils.general import (
-    log_scraper_error,
-    fetch_with_proxy_fallback,
-)
-from comet.utils.mediafusion import mediafusion_config
+from comet.core.logger import log_scraper_error
+from comet.scrapers.base import BaseScraper
+from comet.scrapers.helpers.mediafusion import mediafusion_config
+from comet.scrapers.models import ScrapeRequest
 
 
-async def get_mediafusion(manager, url: str, api_password: str | None):
-    torrents = []
-    try:
-        headers = mediafusion_config.get_headers_for_password(api_password)
+class MediaFusionScraper(BaseScraper):
+    def __init__(
+        self,
+        manager,
+        session,
+        url: str,
+        password: str | None = None,
+    ):
+        super().__init__(manager, session, url)
+        self.password = password
 
-        results = await fetch_with_proxy_fallback(
-            f"{url}/stream/{manager.media_type}/{manager.media_id}.json",
-            headers=headers,
-        )
+    async def scrape(self, request: ScrapeRequest):
+        torrents = []
+        try:
+            headers = mediafusion_config.get_headers_for_password(self.password)
 
-        for torrent in results["streams"]:
-            title_full = torrent["description"]
-            lines = title_full.split("\n")
+            async with self.session.get(
+                f"{self.url}/stream/{request.media_type}/{request.media_id}.json",
+                headers=headers,
+            ) as response:
+                results = await response.json()
 
-            title = lines[0].replace("📂 ", "").replace("/", "")
+            for torrent in results["streams"]:
+                title_full = torrent["description"]
+                lines = title_full.split("\n")
 
-            seeders = None
-            if "👤" in lines[1]:
-                seeders = int(lines[1].split("👤 ")[1].split("\n")[0])
+                title = lines[0].replace("📂 ", "").replace("/", "")
 
-            tracker = lines[-1].split("🔗 ")[1]
+                seeders = None
+                if "👤" in lines[1]:
+                    seeders = int(lines[1].split("👤 ")[1].split("\n")[0])
 
-            torrents.append(
-                {
-                    "title": title,
-                    "infoHash": torrent["infoHash"].lower(),
-                    "fileIndex": torrent.get("fileIdx", None),
-                    "seeders": seeders,
-                    "size": torrent["behaviorHints"][
-                        "videoSize"
-                    ],  # not the pack size but still useful for prowlarr userss
-                    "tracker": f"MediaFusion|{tracker}",
-                    "sources": torrent.get("sources", []),
-                }
-            )
-    except Exception as e:
-        log_scraper_error("MediaFusion", url, manager.media_id, e)
-        pass
+                tracker = lines[-1].split("🔗 ")[1]
 
-    await manager.filter_manager(torrents)
+                torrents.append(
+                    {
+                        "title": title,
+                        "infoHash": torrent["infoHash"].lower(),
+                        "fileIndex": torrent.get("fileIdx", None),
+                        "seeders": seeders,
+                        "size": torrent["behaviorHints"][
+                            "videoSize"
+                        ],  # not the pack size but still useful for prowlarr users
+                        "tracker": f"MediaFusion|{tracker}",
+                        "sources": torrent.get("sources", []),
+                    }
+                )
+        except Exception as e:
+            log_scraper_error("MediaFusion", self.url, request.media_id, e)
+
+        return torrents

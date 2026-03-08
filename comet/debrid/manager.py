@@ -1,80 +1,69 @@
+import hashlib
+
 import aiohttp
 
-from .realdebrid import RealDebrid
-from .alldebrid import AllDebrid
-from .premiumize import Premiumize
-from .torbox import TorBox
-from .debridlink import DebridLink
-from .torrent import Torrent
 from .stremthru import StremThru
-from .debrider import Debrider
-from .easydebrid import EasyDebrid
-from .offcloud import Offcloud
-from .pikpak import PikPak
 
 debrid_services = {
-    "realdebrid": {
-        "extension": "RD",
-        "cache_availability_endpoint": False,
-        "class": RealDebrid,
-    },
-    "alldebrid": {
-        "extension": "AD",
-        "cache_availability_endpoint": False,
-        "class": AllDebrid,
-    },
-    "premiumize": {
-        "extension": "PM",
-        "cache_availability_endpoint": True,
-        "class": Premiumize,
-    },
-    "torbox": {"extension": "TB", "cache_availability_endpoint": True, "class": TorBox},
-    "debridlink": {
-        "extension": "DL",
-        "cache_availability_endpoint": False,
-        "class": DebridLink,
-    },
-    "stremthru": {
-        "extension": "ST",
-        "cache_availability_endpoint": True,
-        "class": StremThru,
-    },
-    "debrider": {
-        "extension": "DB",
-        "cache_availability_endpoint": True,
-        "class": Debrider,
-    },
-    "easydebrid": {
-        "extension": "ED",
-        "cache_availability_endpoint": True,
-        "class": EasyDebrid,
-    },
-    "offcloud": {
-        "extension": "OC",
-        "cache_availability_endpoint": False,
-        "class": Offcloud,
-    },
-    "pikpak": {
-        "extension": "PP",
-        "cache_availability_endpoint": False,
-        "class": PikPak,
-    },
-    "torrent": {
-        "extension": "TORRENT",
-        "cache_availability_endpoint": False,
-        "class": Torrent,
-    },
+    "realdebrid": {"extension": "RD"},
+    "alldebrid": {"extension": "AD"},
+    "premiumize": {"extension": "PM"},
+    "torbox": {"extension": "TB"},
+    "debridlink": {"extension": "DL"},
+    "stremthru": {"extension": "ST"},
+    "debrider": {"extension": "DB"},
+    "easydebrid": {"extension": "ED"},
+    "offcloud": {"extension": "OC"},
+    "pikpak": {"extension": "PP"},
+    "torrent": {"extension": "TORRENT"},
 }
 
 
 def get_debrid_extension(debrid_service: str):
-    original_extension = debrid_services[debrid_service]["extension"]
+    return debrid_services[debrid_service]["extension"]
 
-    return original_extension
+
+def build_addon_name(base_name: str, config: dict) -> str:
+    extensions = []
+    debrid_entries = config.get("_debridEntries", [])
+    enable_torrent = config.get("_enableTorrent", False)
+
+    for entry in debrid_entries:
+        ext = get_debrid_extension(entry["service"])
+        if ext and ext not in extensions:
+            extensions.append(ext)
+
+    if enable_torrent and debrid_entries:
+        extensions.append("TORRENT")
+
+    extension_str = "+".join(extensions) if extensions else ""
+    return f"{base_name}{(' | ' + extension_str) if extension_str else ''}"
 
 
 def build_stremthru_token(debrid_service: str, debrid_api_key: str):
     return f"{debrid_service}:{debrid_api_key}"
+
+
+def build_account_key_hash(debrid_api_key: str) -> str:
+    return hashlib.sha256((debrid_api_key or "").encode("utf-8")).hexdigest()
+
+
+def get_debrid_credentials(config: dict, service_index: int | None = None):
+    debrid_entries = config.get("_debridEntries", [])
+
+    if (
+        debrid_entries
+        and service_index is not None
+        and 0 <= service_index < len(debrid_entries)
+    ):
+        entry = debrid_entries[service_index]
+        return entry["service"], entry["apiKey"]
+
+    if debrid_entries:
+        entry = debrid_entries[0]
+        return entry["service"], entry["apiKey"]
+
+    return config.get("debridService", "torrent"), config.get("debridApiKey", "")
 
 
 def get_debrid(
@@ -86,7 +75,7 @@ def get_debrid(
     ip: str,
 ):
     if debrid_service != "torrent":
-        return debrid_services["stremthru"]["class"](
+        return StremThru(
             session,
             video_id,
             media_only_id,
@@ -107,9 +96,11 @@ async def retrieve_debrid_availability(
     tracker_map: dict,
     sources_map: dict,
 ):
-    if debrid_service == "torrent":
-        return []
-
     return await get_debrid(
         session, video_id, media_only_id, debrid_service, debrid_api_key, ip
-    ).get_availability(info_hashes, seeders_map, tracker_map, sources_map)
+    ).get_availability(
+        info_hashes,
+        seeders_map,
+        tracker_map,
+        sources_map,
+    )

@@ -1,47 +1,50 @@
 import re
 
-from comet.utils.general import (
-    size_to_bytes,
-    log_scraper_error,
-    fetch_with_proxy_fallback,
-)
-
+from comet.core.logger import log_scraper_error
+from comet.scrapers.base import BaseScraper
+from comet.scrapers.models import ScrapeRequest
+from comet.utils.formatting import size_to_bytes
 
 data_pattern = re.compile(
     r"💾 ([\d.]+ [KMGT]B)\s+👥 (\d+)\s+⚙️ (\w+)",
 )
 
 
-async def get_jackettio(manager, url: str):
-    torrents = []
-    try:
-        results = await fetch_with_proxy_fallback(
-            f"{url}/stream/{manager.media_type}/{manager.media_id}.json"
-        )
+class JackettioScraper(BaseScraper):
+    def __init__(self, manager, session, url: str):
+        super().__init__(manager, session, url)
 
-        for torrent in results["streams"]:
-            title_full = torrent["title"]
+    async def scrape(self, request: ScrapeRequest):
+        torrents = []
+        try:
+            async with self.session.get(
+                f"{self.url}/stream/{request.media_type}/{request.media_id}.json",
+            ) as response:
+                results = await response.json()
 
-            title = title_full.split("\n")[0]
+            for torrent in results["streams"]:
+                title_full = torrent["title"]
 
-            match = data_pattern.search(title_full)
+                title = title_full.split("\n")[0]
 
-            size = size_to_bytes(match.group(1))
-            seeders = int(match.group(2))
-            tracker = match.group(3)
+                match = data_pattern.search(title_full)
 
-            torrents.append(
-                {
-                    "title": title,
-                    "infoHash": torrent["infoHash"],
-                    "fileIndex": None,
-                    "seeders": seeders,
-                    "size": size,
-                    "tracker": f"Jackettio|{tracker}",
-                    "sources": None,
-                }
-            )
-    except Exception as e:
-        log_scraper_error("Jackettio", url, manager.media_id, e)
+                size = size_to_bytes(match.group(1)) if match else None
+                seeders = int(match.group(2)) if match else None
+                tracker = match.group(3) if match else "Jackettio"
 
-    await manager.filter_manager(torrents)
+                torrents.append(
+                    {
+                        "title": title,
+                        "infoHash": torrent["infoHash"],
+                        "fileIndex": None,
+                        "seeders": seeders,
+                        "size": size,
+                        "tracker": f"Jackettio|{tracker}",
+                        "sources": None,
+                    }
+                )
+        except Exception as e:
+            log_scraper_error("Jackettio", self.url, request.media_id, e)
+
+        return torrents

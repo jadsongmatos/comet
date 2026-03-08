@@ -1,40 +1,52 @@
-from comet.utils.general import (
-    log_scraper_error,
-    fetch_with_proxy_fallback,
-)
+from comet.core.logger import log_scraper_error
+from comet.scrapers.base import BaseScraper
+from comet.scrapers.models import ScrapeRequest
 
 
-async def get_comet(manager, url: str):
-    torrents = []
-    try:
-        results = await fetch_with_proxy_fallback(
-            f"{url}/stream/{manager.media_type}/{manager.media_id}.json"
-        )
+class CometScraper(BaseScraper):
+    def __init__(self, manager, session, url: str):
+        super().__init__(manager, session, url)
 
-        for torrent in results["streams"]:
-            title_full = torrent["description"]
-            title = title_full.split("\n")[0].split("📄 ")[1]
+    async def scrape(self, request: ScrapeRequest):
+        torrents = []
+        try:
+            async with self.session.get(
+                f"{self.url}/stream/{request.media_type}/{request.media_id}.json",
+            ) as response:
+                results = await response.json()
 
-            seeders = (
-                int(title_full.split("👤 ")[1].split(" ")[0])
-                if "👤" in title_full
-                else None
-            )
-            tracker = title_full.split("🔎 ")[1].split("\n")[0]
+            for torrent in results["streams"]:
+                title_full = torrent["description"]
 
-            torrents.append(
-                {
-                    "title": title,
-                    "infoHash": torrent["infoHash"].lower(),
-                    "fileIndex": torrent.get("fileIdx", None),
-                    "seeders": seeders,
-                    "size": torrent["behaviorHints"]["videoSize"],
-                    "tracker": f"Comet|{tracker}",
-                    "sources": torrent.get("sources", []),
-                }
-            )
-    except Exception as e:
-        log_scraper_error("Comet", url, manager.media_id, e)
-        pass
+                try:
+                    title = title_full.split("\n")[0].split("📄 ")[1]
+                except Exception:
+                    continue
 
-    await manager.filter_manager(torrents)
+                seeders = (
+                    int(title_full.split("👤 ")[1].split(" ")[0])
+                    if "👤" in title_full
+                    else None
+                )
+
+                tracker = None
+                if "🔎 " in title_full:
+                    tracker = title_full.split("🔎 ")[1].split("\n")[0]
+
+                torrents.append(
+                    {
+                        "title": title,
+                        "infoHash": torrent["infoHash"].lower(),
+                        "fileIndex": torrent.get("fileIdx", None),
+                        "seeders": seeders,
+                        "size": torrent["behaviorHints"]["videoSize"],
+                        "tracker": f"Comet|{tracker}"
+                        if tracker is not None
+                        else "Comet",
+                        "sources": torrent.get("sources", []),
+                    }
+                )
+        except Exception as e:
+            log_scraper_error("Comet", self.url, request.media_id, e)
+
+        return torrents
